@@ -77,6 +77,7 @@ public:
     bool updateTexture();
 
     void invalidateTexture();
+    void invalidated();
 
 public slots:
     void releaseTexture();
@@ -283,6 +284,20 @@ void GStreamerVideoTexture::releaseTexture()
         EGLSyncKHR sync = eglCreateSyncKHR(m_display, EGL_SYNC_FENCE_KHR, NULL);
         nemo_gst_video_texture_release_frame(sink, sync);
     }
+}
+
+void GStreamerVideoTexture::invalidated()
+{
+    NemoGstVideoTexture *sink = NEMO_GST_VIDEO_TEXTURE(m_sink);
+
+    nemo_gst_video_texture_unbind_frame(sink);
+
+    if (m_textureId) {
+        glDeleteTextures(1, &m_textureId);
+        m_textureId = 0;
+    }
+
+    nemo_gst_video_texture_release_frame(sink, NULL);
 }
 
 class GStreamerVideoMaterialShader : public QSGMaterialShader
@@ -650,6 +665,8 @@ QSGNode *NemoVideoTextureBackend::updatePaintNode(QSGNode *oldNode, QQuickItem::
         connect(q->window(), SIGNAL(afterRendering()),
                 m_texture, SLOT(releaseTexture()),
                 Qt::DirectConnection);
+        connect(q->window(), &QQuickWindow::sceneGraphInvalidated, m_texture,
+                &GStreamerVideoTexture::invalidated, Qt::DirectConnection);
     }
     m_texture->setTextureSize(m_textureSize);
 
