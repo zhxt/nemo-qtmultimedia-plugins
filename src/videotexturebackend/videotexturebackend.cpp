@@ -807,6 +807,8 @@ GstPadProbeReturn NemoVideoTextureBackend::probe(GstPad *, GstPadProbeInfo *info
         } else {
             orientation = 0;
         }
+
+        g_free(orientationTag);
     } else if (GST_EVENT_TYPE(event) == GST_EVENT_STREAM_START) {
         orientation = 0;
     }
