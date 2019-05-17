@@ -486,7 +486,8 @@ signals:
 
 private slots:
     void orientationChanged();
-    void mirrorChanged();
+    void sourceChanged();
+    void cameraStateChanged(QCamera::State newState);
 
 private:
     static void frame_ready(GstElement *sink, int frame, void *data);
@@ -497,6 +498,7 @@ private:
     GstElement *m_sink;
     EGLDisplay m_display;
     GStreamerVideoTexture *m_texture;
+    QCamera *m_camera;
     QSize m_nativeSize;
     QSize m_textureSize;
     QSize m_implicitSize;
@@ -515,6 +517,7 @@ NemoVideoTextureBackend::NemoVideoTextureBackend(QDeclarativeVideoOutput *parent
     , m_sink(0)
     , m_display(0)
     , m_texture(0)
+    , m_camera(0)
     , m_signalId(0)
     , m_probeId(0)
     , m_orientation(0)
@@ -578,9 +581,46 @@ void NemoVideoTextureBackend::orientationChanged()
     }
 }
 
-void NemoVideoTextureBackend::mirrorChanged()
+
+
+void NemoVideoTextureBackend::sourceChanged()
 {
-    const bool mirror = q->property("mirror").toBool();
+    if (m_camera) {
+        disconnect(m_camera, SIGNAL(stateChanged(QCamera::State)), this, SLOT(cameraStateChanged(QCamera::State)));
+        m_camera = 0;
+    }
+
+    QObject *source = q->source();
+    if (source) {
+        // Check if the mediaObject of the source is a QCamera
+        const QMetaObject *metaObject = source->metaObject();
+        int mediaObjectPropertyIndex = metaObject->indexOfProperty("mediaObject");
+        int deviceIdPropertyIndex = metaObject->indexOfProperty("deviceId");
+
+        if (mediaObjectPropertyIndex != -1 && deviceIdPropertyIndex != -1) { // Camera source
+            QCamera *camera = qobject_cast<QCamera*>(source->property("mediaObject").value<QObject*>());
+            // Watch its state
+            if (camera) {
+                m_camera = camera;
+                connect(m_camera, SIGNAL(stateChanged(QCamera::State)), this, SLOT(cameraStateChanged(QCamera::State)));
+            }
+        }
+    }
+}
+
+void NemoVideoTextureBackend::cameraStateChanged(QCamera::State newState)
+{
+    // Check the camera position when we get into the Active state
+    if (newState != QCamera::ActiveState) {
+        return;
+    }
+    bool mirror = false;
+
+    if (m_camera) {
+        QCameraInfo info(*m_camera);
+        mirror = (info.position() == QCamera::FrontFace);
+    }
+
     if (m_mirror != mirror) {
         m_mirror = mirror;
         m_geometryChanged = true;
@@ -610,14 +650,7 @@ bool NemoVideoTextureBackend::init(QMediaService *service)
 
     connect(this, SIGNAL(nativeSizeChanged()), q, SLOT(_q_updateNativeSize()));
     connect(q, SIGNAL(orientationChanged()), this, SLOT(orientationChanged()));
-
-    const int mirrorIndex = q->metaObject()->indexOfProperty("mirror");
-    if (mirrorIndex != -1) {
-        QMetaObject::connect(
-                    q, q->metaObject()->property(mirrorIndex).notifySignalIndex(),
-                    this, staticMetaObject.indexOfMethod("mirrorChanged()"));
-        mirrorChanged();
-    }
+    connect(q, SIGNAL(sourceChanged()), this, SLOT(sourceChanged()));
 
     return true;
 }
