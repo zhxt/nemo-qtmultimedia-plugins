@@ -648,6 +648,8 @@ bool NemoVideoTextureBackend::init(QMediaService *service)
     m_service = service;
     m_control->setElement(m_sink);
 
+    m_orientation = q->orientation();
+
     connect(this, SIGNAL(nativeSizeChanged()), q, SLOT(_q_updateNativeSize()));
     connect(q, SIGNAL(orientationChanged()), this, SLOT(orientationChanged()));
     connect(q, SIGNAL(sourceChanged()), this, SLOT(sourceChanged()));
