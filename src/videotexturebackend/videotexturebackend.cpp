@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2014 Jolla Ltd
- * Contact: Andrew den Exter <andrew.den.exter@jollamobile.com>
+ * Copyright (c) 2014 - 2019 Jolla Ltd.
+ * Copyright (c) 2020 Open Mobile Platform LLC.
  *
  * You may use this file under the terms of the BSD license as follows:
  *
@@ -30,98 +30,11 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
  */
 
-#include <private/qdeclarativevideooutput_backend_p.h>
-#include <private/qdeclarativevideooutput_p.h>
+#include "videotexturebackend.h"
 
-#include <QGuiApplication>
-#include <QMediaObject>
-#include <QMediaService>
-#include <QMutex>
-#include <QResizeEvent>
-#include <QQuickWindow>
-#include <QSGGeometry>
-#include <QSGGeometryNode>
-#include <QSGMaterial>
-#include <QSGTexture>
-
-#include <qpa/qplatformnativeinterface.h>
-#include <private/qgstreamerelementcontrol_p.h>
-
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#include <gst/interfaces/nemovideotexture.h>
-#include <gst/video/gstvideometa.h>
-
-#include <QThread>
+namespace NemoVideoBackend {
 
 #define EGL_SYNC_FENCE_KHR                      0x30F9
-
-class GStreamerVideoTexture : public QSGDynamicTexture
-{
-    Q_OBJECT
-public:
-    GStreamerVideoTexture(GstElement *sink, EGLDisplay display);
-    ~GStreamerVideoTexture();
-
-    bool isActive() const;
-
-    int textureId() const;
-    QSize textureSize() const;
-    void setTextureSize(const QSize &size);
-    bool hasAlphaChannel() const;
-    bool hasMipmaps() const;
-
-    QRectF normalizedTextureSubRect() const;
-
-    void bind();
-    bool updateTexture();
-
-    void invalidateTexture();
-    void invalidated();
-
-public slots:
-    void releaseTexture();
-
-private:
-    GstElement *m_sink;
-    EGLDisplay m_display;
-    QRectF m_subRect;
-    QSize m_textureSize;
-    GLuint m_textureId;
-    bool m_updated;
-};
-
-class GStreamerVideoMaterial : public QSGMaterial
-{
-public:
-    GStreamerVideoMaterial(GStreamerVideoTexture *texture);
-
-    QSGMaterialShader *createShader() const;
-    QSGMaterialType *type() const;
-    int compare(const QSGMaterial *other) const;
-
-    void setTexture(GStreamerVideoTexture *texture);
-
-private:
-    friend class GStreamerVideoMaterialShader;
-    friend class GStreamerVideoNode;
-
-    GStreamerVideoTexture *m_texture;
-};
-
-class GStreamerVideoNode : public QSGGeometryNode
-{
-public:
-    GStreamerVideoNode(GStreamerVideoTexture *texture);
-    ~GStreamerVideoNode();
-
-    void setBoundingRect(const QRectF &rect, int orientation, bool horizontalMirror, bool verticalMirror);
-    void preprocess();
-
-private:
-    GStreamerVideoMaterial m_material;
-    QSGGeometry m_geometry;
-};
 
 GStreamerVideoTexture::GStreamerVideoTexture(GstElement *sink, EGLDisplay display)
     : m_sink(sink)
@@ -129,6 +42,7 @@ GStreamerVideoTexture::GStreamerVideoTexture(GstElement *sink, EGLDisplay displa
     , m_subRect(0, 0, 1, 1)
     , m_textureId(0)
     , m_updated(false)
+    , m_videoBuffer(nullptr)
 {
     gst_object_ref(GST_OBJECT(m_sink));
 }
@@ -239,21 +153,45 @@ bool GStreamerVideoTexture::updateTexture()
         }
         nemo_gst_video_texture_release_frame(sink, NULL);
         return false;
-    } else {
-        if (!m_textureId) {
-            glGenTextures(1, &m_textureId);
-            glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
-            glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        } else {
-            glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
-        }
-        glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
-        m_updated = true;
-        return true;
     }
+
+    if (!m_textureId) {
+        glGenTextures(1, &m_textureId);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
+        glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    } else {
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
+    }
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
+
+    // if we have video filters attached to owning VideoOutput,
+    // render video frame into a framebuffer to be able to get its pixels;
+    // if no filters, don't do this, it affects performance.
+
+    // hold mutex lock on m_filters vector during processing
+    {
+        QMutexLocker locker(&m_filtersMutex);
+
+        if (!m_filters.isEmpty()) { // for example, QVector::isEmpty() requires mutex to be held
+
+            if (!m_videoBuffer) {
+                // create only once
+                m_videoBuffer = new TextureVideoBuffer();
+            }
+            // update texture size and ID for every frame
+            m_videoBuffer->setTextureSize(m_textureSize);
+            m_videoBuffer->setTextureId(m_textureId);
+            m_videoBuffer->updateFrame();  // renders frame image to FBO
+        }
+        //callVideoFilterRunnables has it's own locker
+    }
+    callVideoFilterRunnables();
+
+    m_updated = true;
+    return true;
 }
 
 void GStreamerVideoTexture::invalidateTexture()
@@ -271,6 +209,10 @@ void GStreamerVideoTexture::releaseTexture()
 
     if (m_updated) {
         m_updated = false;
+
+        if (m_videoBuffer) {
+            m_videoBuffer->setTextureId(0);   // invalidate texture id
+        }
 
         NemoGstVideoTexture *sink = NEMO_GST_VIDEO_TEXTURE(m_sink);
 
@@ -299,6 +241,77 @@ void GStreamerVideoTexture::invalidated()
 
     nemo_gst_video_texture_release_frame(sink, NULL);
 }
+
+QVector<FilterInfo> GStreamerVideoTexture::swapVideoFilters(QVector<FilterInfo> &filters)
+{
+    QMutexLocker guard(&m_filtersMutex);
+    m_filters.swap(filters);
+    createVideoFilterRunnables();
+    return filters;
+}
+
+void GStreamerVideoTexture::createVideoFilterRunnables()
+{
+    // intended to be called when m_filtersMutex is locked
+    for (FilterInfo &finfo: m_filters) {
+        if (Q_UNLIKELY(!finfo.filter)) {
+            continue;
+        }
+        if (!finfo.runnable) {
+            finfo.runnable = finfo.filter->createFilterRunnable();
+        }
+    }
+}
+
+void GStreamerVideoTexture::callVideoFilterRunnables()
+{
+    QMutexLocker locker(&m_filtersMutex);
+
+    if(m_filters.isEmpty())
+        return;
+
+    // intended to be called when m_filtersMutex is unlocked
+
+    // create video frame and its format descriptor: construct
+    //   video frame from video buffer
+    QVideoFrame vframe(m_videoBuffer.data(), m_textureSize, QVideoFrame::Format_BGRA32);
+    QVideoSurfaceFormat surfaceFormat(m_textureSize, vframe.pixelFormat(),
+                                      m_videoBuffer->handleType());
+
+    bool frameWasFiltered = false;
+    // pass frame to each filter
+    QVector<FilterInfo> filters = m_filters;
+
+    //we have local copy of filters and can process it without locking
+    locker.unlock();
+    for (int i = 0; i < filters.size(); ++i) {
+        const FilterInfo &finfo = filters.at(i);
+        if (Q_UNLIKELY(!finfo.runnable)) {
+            continue;
+        }
+
+        QVideoFilterRunnable::RunFlags runFlag = 0;
+        // the only flag we can set for QVideoFilterRunnable is a marker
+        //    that this filter is a last filter in chain
+        if (i == filters.size() - 1) {
+            runFlag |= QVideoFilterRunnable::LastInChain;
+        }
+
+        // actually call filter runnable here
+        QVideoFrame newFrame = finfo.runnable->run(&vframe, surfaceFormat, runFlag);
+        if (newFrame != vframe) {
+            frameWasFiltered = true;
+            vframe = newFrame;
+        }
+    }
+
+    // TODO: if frame data has changed, write it back to video buffer.
+    if (frameWasFiltered) {
+        qWarning() << "call_video_filters(): filters have changed a frame!";
+        qWarning() << "  But we don't support changing video frames in filter now.";
+    }
+}
+
 
 class GStreamerVideoMaterialShader : public QSGMaterialShader
 {
@@ -454,70 +467,12 @@ void GStreamerVideoNode::setBoundingRect(
     memcpy(m_geometry.vertexDataAsTexturedPoint2D(), vertices, sizeof(vertices));
 }
 
-class ImplicitSizeVideoOutput : public QDeclarativeVideoOutput
-{
-public:
-    using QQuickItem::setImplicitSize;
-};
-
-class NemoVideoTextureBackend : public QObject, public QDeclarativeVideoBackend
-{
-    Q_OBJECT
-public:
-    explicit NemoVideoTextureBackend(QDeclarativeVideoOutput *parent);
-    virtual ~NemoVideoTextureBackend();
-
-    bool init(QMediaService *service);
-    void releaseSource();
-    void releaseControl();
-    void itemChange(QQuickItem::ItemChange change, const QQuickItem::ItemChangeData &changeData);
-    QSize nativeSize() const;
-    void updateGeometry();
-    QSGNode *updatePaintNode(QSGNode *oldNode, QQuickItem::UpdatePaintNodeData *data);
-    QAbstractVideoSurface *videoSurface() const;
-
-    // The viewport, adjusted for the pixel aspect ratio
-    QRectF adjustedViewport() const;
-
-    bool event(QEvent *event);
-
-signals:
-    void nativeSizeChanged();
-
-private slots:
-    void orientationChanged();
-    void sourceChanged();
-    void cameraStateChanged(QCamera::State newState);
-
-private:
-    static void frame_ready(GstElement *sink, int frame, void *data);
-    static GstPadProbeReturn probe(GstPad *pad, GstPadProbeInfo *info, void *data);
-
-    QMutex m_mutex;
-    QPointer<QGStreamerElementControl> m_control;
-    GstElement *m_sink;
-    EGLDisplay m_display;
-    GStreamerVideoTexture *m_texture;
-    QCamera *m_camera;
-    QSize m_nativeSize;
-    QSize m_textureSize;
-    QSize m_implicitSize;
-    gulong m_signalId;
-    gulong m_probeId;
-    int m_orientation;
-    int m_textureOrientation;
-    bool m_mirror;
-    bool m_active;
-    bool m_geometryChanged;
-    bool m_frameChanged;
-};
-
 NemoVideoTextureBackend::NemoVideoTextureBackend(QDeclarativeVideoOutput *parent)
     : QDeclarativeVideoBackend(parent)
-    , m_sink(0)
+    , m_sink(nullptr)
     , m_display(0)
-    , m_texture(0)
-    , m_camera(0)
+    , m_texture(nullptr, [](QObject* obj) {if (obj) obj->deleteLater();})
+    , m_camera(nullptr)
     , m_signalId(0)
     , m_probeId(0)
     , m_orientation(0)
@@ -558,16 +513,10 @@ NemoVideoTextureBackend::~NemoVideoTextureBackend()
     releaseControl();
 
     if (m_sink) {
-        QMutexLocker locker(&m_mutex);
-
         g_signal_handler_disconnect(G_OBJECT(m_sink), m_signalId);
         gst_pad_remove_probe(gst_element_get_static_pad(m_sink, "sink"), m_probeId);
         gst_object_unref(GST_OBJECT(m_sink));
         m_sink = 0;
-    }
-
-    if (m_texture) {
-        m_texture->deleteLater();
     }
 }
 
@@ -575,19 +524,22 @@ void NemoVideoTextureBackend::orientationChanged()
 {
     const int orientation = q->orientation();
     if (m_orientation != orientation) {
-        m_orientation = orientation;
-        m_geometryChanged = true;
+        {
+            QMutexLocker locker(&m_mutex);
+            m_orientation = orientation;
+            m_geometryChanged = true;
+        }
         q->update();
     }
 }
 
 
-
 void NemoVideoTextureBackend::sourceChanged()
 {
+    QMutexLocker locker(&m_mutex);
     if (m_camera) {
         disconnect(m_camera, SIGNAL(stateChanged(QCamera::State)), this, SLOT(cameraStateChanged(QCamera::State)));
-        m_camera = 0;
+        m_camera = nullptr;
     }
 
     QObject *source = q->source();
@@ -614,6 +566,7 @@ void NemoVideoTextureBackend::cameraStateChanged(QCamera::State newState)
     if (newState != QCamera::ActiveState) {
         return;
     }
+    QMutexLocker locker(&m_mutex);
     bool mirror = false;
 
     if (m_camera) {
@@ -663,6 +616,7 @@ void NemoVideoTextureBackend::releaseSource()
 
 void NemoVideoTextureBackend::releaseControl()
 {
+    QMutexLocker locker(&m_mutex);
     if (m_service && m_control) {
         m_service->releaseControl(m_control.data());
         m_control = 0;
@@ -680,6 +634,7 @@ QSize NemoVideoTextureBackend::nativeSize() const
 
 void NemoVideoTextureBackend::updateGeometry()
 {
+    QMutexLocker locker(&m_mutex);
     m_geometryChanged = true;
 }
 
@@ -687,26 +642,30 @@ QSGNode *NemoVideoTextureBackend::updatePaintNode(QSGNode *oldNode, QQuickItem::
 {
     GStreamerVideoNode *node = static_cast<GStreamerVideoNode *>(oldNode);
 
+    QMutexLocker locker(&m_mutex);
+
     if (!m_active) {
         if (m_texture) {
             m_texture->invalidateTexture();
         }
         delete node;
-        return 0;
+        return nullptr;
     }
 
     if (!m_texture) {
-        m_texture = new GStreamerVideoTexture(m_sink, m_display);
-        connect(q->window(), SIGNAL(afterRendering()),
-                m_texture, SLOT(releaseTexture()),
+        m_texture.reset(new GStreamerVideoTexture(m_sink, m_display));
+        syncFilters();
+        connect(q->window(), &QQuickWindow::afterRendering,
+                m_texture.get(), &GStreamerVideoTexture::releaseTexture,
                 Qt::DirectConnection);
-        connect(q->window(), &QQuickWindow::sceneGraphInvalidated, m_texture,
-                &GStreamerVideoTexture::invalidated, Qt::DirectConnection);
+        connect(q->window(), &QQuickWindow::sceneGraphInvalidated,
+                m_texture.get(), &GStreamerVideoTexture::invalidated,
+                Qt::DirectConnection);
     }
     m_texture->setTextureSize(m_textureSize);
 
     if (!node) {
-        node = new GStreamerVideoNode(m_texture);
+        node = new GStreamerVideoNode(m_texture.get());
         m_geometryChanged = true;
     }
 
@@ -739,7 +698,63 @@ QSGNode *NemoVideoTextureBackend::updatePaintNode(QSGNode *oldNode, QQuickItem::
 
 QAbstractVideoSurface *NemoVideoTextureBackend::videoSurface() const
 {
-    return 0;
+    return nullptr;
+}
+
+void NemoVideoTextureBackend::appendFilter(QAbstractVideoFilter *filter)
+{
+    QMutexLocker locker(&m_mutex);
+    m_filters += FilterInfo(filter);
+    syncFilters();
+}
+
+void NemoVideoTextureBackend::clearFilters()
+{
+    QMutexLocker locker(&m_mutex);
+    m_filters.clear();
+    syncFilters();
+}
+
+class FilterDeleterRunnable: public QRunnable
+{
+public:
+    FilterDeleterRunnable(const QList<QVideoFilterRunnable *> &runnables):
+        m_runnables(runnables) { }
+
+    virtual void run() override {
+        qDeleteAll(m_runnables);
+        m_runnables.clear();
+    }
+
+private:
+    QList<QVideoFilterRunnable *> m_runnables;
+};
+
+void NemoVideoTextureBackend::syncFilters()
+{
+    // This function may be called very early, during contruction of
+    // QQuickItem representing VideoOutput (QDeclarativeVideoOutput),
+    // and texture is created later, on first call to updatePaintNode(),
+    // so we may not have a texture here yet to notify about having filters.
+    // P.S. syncFilters() is called again in updatePaintNode() once, after
+    //      the texture is created.
+    if (m_texture) {
+        const QVector<FilterInfo> oldFilters = m_texture->swapVideoFilters(m_filters);
+        QList<QVideoFilterRunnable*> runnables;
+        for (const FilterInfo &oldFilter : oldFilters) {
+            if (oldFilter.runnable) {
+                runnables.append(oldFilter.runnable);
+            }
+        }
+        if (!runnables.isEmpty()) {
+            // Request the scenegraph to run our cleanup job on the render thread.
+            // The execution of our QRunnable may happen after the QML tree
+            // including the QAbstractVideoFilter instance is destroyed on the
+            // main thread so no references to it must be used during cleanup.
+            q->window()->scheduleRenderJob(new FilterDeleterRunnable(runnables),
+                                           QQuickWindow::BeforeSynchronizingStage);
+        }
+    }
 }
 
 // The viewport, adjusted for the pixel aspect ratio
@@ -756,6 +771,7 @@ QRectF NemoVideoTextureBackend::adjustedViewport() const
 bool NemoVideoTextureBackend::event(QEvent *event)
 {
     if (event->type() == QEvent::Resize) {
+        QMutexLocker locker(&m_mutex);
         m_nativeSize = static_cast<QResizeEvent *>(event)->size();
         if (m_nativeSize.isValid()) {
             if ((m_orientation % 180) != 0) {
@@ -866,17 +882,6 @@ GstPadProbeReturn NemoVideoTextureBackend::probe(GstPad *, GstPadProbeInfo *info
     return GST_PAD_PROBE_OK;
 }
 
-class NemoVideoTextureBackendPlugin : public QObject, public QDeclarativeVideoBackendFactoryInterface
-{
-    Q_OBJECT
-    Q_INTERFACES(QDeclarativeVideoBackendFactoryInterface)
-    Q_PLUGIN_METADATA(IID "org.qt-project.qt.declarativevideobackendfactory/5.2" FILE "videotexturebackend.json")
-public:
-    NemoVideoTextureBackendPlugin();
-
-    QDeclarativeVideoBackend *create(QDeclarativeVideoOutput *parent);
-};
-
 NemoVideoTextureBackendPlugin::NemoVideoTextureBackendPlugin()
 {
     gst_init(0, 0);
@@ -887,4 +892,4 @@ QDeclarativeVideoBackend *NemoVideoTextureBackendPlugin::create(QDeclarativeVide
     return new NemoVideoTextureBackend(parent);
 }
 
-#include "videotexturebackend.moc"
+} //namespace NemoVideoBackend

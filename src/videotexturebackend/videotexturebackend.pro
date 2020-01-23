@@ -3,6 +3,7 @@ TARGET = gstnemovideotexturebackend
 TARGET = $$qtLibraryTarget($$TARGET)
 
 QT += \
+        gui \
         gui-private \
         quick \
         multimedia \
@@ -23,7 +24,12 @@ LIBS += -lqgsttools_p
 DEFINES += MESA_EGL_NO_X11_HEADERS
 
 SOURCES += \
+        texturevideobuffer.cpp \
         videotexturebackend.cpp
+
+HEADERS += \
+        texturevideobuffer.h \
+        videotexturebackend.h
 
 target.path = $$[QT_INSTALL_PLUGINS]/video/declarativevideobackend
 

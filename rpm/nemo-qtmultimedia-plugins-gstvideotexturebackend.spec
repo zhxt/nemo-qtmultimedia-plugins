@@ -1,6 +1,6 @@
 Name:       nemo-qtmultimedia-plugins-gstvideotexturebackend
 Summary:    QtMultimedia QML VideoOutput backend for GStreamer NemoVideoTexture interface
-Version:    0.0.0
+Version:    0.0.14
 Release:    1
 Group:      System/Libraries
 License:    BSD
