@@ -771,15 +771,17 @@ QRectF NemoVideoTextureBackend::adjustedViewport() const
 bool NemoVideoTextureBackend::event(QEvent *event)
 {
     if (event->type() == QEvent::Resize) {
-        QMutexLocker locker(&m_mutex);
-        m_nativeSize = static_cast<QResizeEvent *>(event)->size();
-        if (m_nativeSize.isValid()) {
-            if ((m_orientation % 180) != 0) {
-                m_nativeSize.transpose();
+        QSize nativeSize = static_cast<QResizeEvent *>(event)->size();
+        if (nativeSize.isValid()) {
+            {
+                QMutexLocker locker(&m_mutex);
+                m_nativeSize = nativeSize;
+                if ((m_orientation % 180) != 0) {
+                    m_nativeSize.transpose();
+                }
             }
-
             static_cast<ImplicitSizeVideoOutput *>(q)->setImplicitSize(
-                        m_nativeSize.width(), m_nativeSize.height());
+                        nativeSize.width(), nativeSize.height());
         }
         q->update();
         emit nativeSizeChanged();
@@ -797,6 +799,8 @@ void NemoVideoTextureBackend::frame_ready(GstElement *, int frame, void *data)
     NemoVideoTextureBackend *instance = static_cast<NemoVideoTextureBackend *>(data);
 
     if (frame < 0) {
+        QMutexLocker locker(&instance->m_mutex);
+
         instance->m_active = false;
     } else {
         QMutexLocker locker(&instance->m_mutex);
