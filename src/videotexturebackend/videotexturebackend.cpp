@@ -577,6 +577,7 @@ void NemoVideoTextureBackend::cameraStateChanged(QCamera::State newState)
     if (m_mirror != mirror) {
         m_mirror = mirror;
         m_geometryChanged = true;
+        locker.unlock();
         q->update();
     }
 }
@@ -616,10 +617,9 @@ void NemoVideoTextureBackend::releaseSource()
 
 void NemoVideoTextureBackend::releaseControl()
 {
-    QMutexLocker locker(&m_mutex);
     if (m_service && m_control) {
-        m_service->releaseControl(m_control.data());
-        m_control = 0;
+        m_service->releaseControl(m_control);
+        m_control.clear();
     }
 }
 
