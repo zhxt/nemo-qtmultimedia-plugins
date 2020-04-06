@@ -55,7 +55,6 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <gst/interfaces/nemovideotexture.h>
 #include <gst/video/gstvideometa.h>
 
 #include "texturevideobuffer.h"
@@ -64,8 +63,12 @@ namespace NemoVideoBackend {
 struct FilterInfo {
     FilterInfo() { }   // QVector requires default constructor to be present
     FilterInfo(QAbstractVideoFilter *f) : filter(f) { }
+    FilterInfo(QAbstractVideoFilter *f, QVideoFilterRunnable *r) : filter(f), runnable(r) { }
     QAbstractVideoFilter *filter = nullptr;
     QVideoFilterRunnable *runnable = nullptr;
+    bool destroy = false;
+    bool create = true;
+    bool created = false;
 };
 
 
@@ -73,10 +76,8 @@ class GStreamerVideoTexture : public QSGDynamicTexture
 {
     Q_OBJECT
 public:
-    GStreamerVideoTexture(GstElement *sink, EGLDisplay display);
+    GStreamerVideoTexture(EGLDisplay display);
     ~GStreamerVideoTexture();
-
-    bool isActive() const;
 
     int textureId() const override;
     QSize textureSize() const override;
@@ -92,30 +93,36 @@ public:
     void invalidateTexture();
     void invalidated();
 
-    QVector<FilterInfo> swapVideoFilters(QVector<FilterInfo> &filters);
-
-public slots:
-    void releaseTexture();
-
-protected:
-    void createVideoFilterRunnables();
-    void callVideoFilterRunnables();
+    void setBuffer(GstBuffer *buffer);
+    void invalidateBuffers();
+    void syncFilters(QVector<FilterInfo> &filters);
 
 private:
-    GstElement *m_sink;
+    inline  void callVideoFilterRunnables();
+    inline void destroyCachedTextures();
+
+    struct CachedTexture
+    {
+        GstMemory *memory;
+        EGLImageKHR image;
+        GLuint textureId;
+    };
+
+    GstBuffer *m_buffer;
     EGLDisplay m_display;
+    std::vector<CachedTexture> m_textures;
     QRectF m_subRect;
     QSize m_textureSize;
     GLuint m_textureId;
-    bool m_updated;
+    bool m_bufferChanged;
+    bool m_buffersInvalidated;
 
     // to get pixels from each video frame
-    QPointer<TextureVideoBuffer> m_videoBuffer;
+    QScopedPointer<TextureVideoBuffer> m_videoBuffer;
     QVector<FilterInfo> m_filters;
-    mutable QMutex m_filtersMutex;
 };
 
-class GStreamerVideoMaterial : public QSGMaterial
+class GStreamerVideoMaterial : public QObject, public QSGMaterial
 {
 public:
     GStreamerVideoMaterial(GStreamerVideoTexture *texture);
@@ -124,7 +131,6 @@ public:
     QSGMaterialType *type() const override;
     int compare(const QSGMaterial *other) const override;
 
-    void setTexture(GStreamerVideoTexture *texture);
 
 private:
     friend class GStreamerVideoMaterialShader;
@@ -138,6 +144,8 @@ class GStreamerVideoNode : public QSGGeometryNode
 public:
     GStreamerVideoNode(GStreamerVideoTexture *texture);
     ~GStreamerVideoNode();
+
+    GStreamerVideoTexture *texture() { return m_material.m_texture; }
 
     void setBoundingRect(const QRectF &rect, int orientation, bool horizontalMirror, bool verticalMirror);
     void preprocess() override;
@@ -178,6 +186,7 @@ public:
     bool event(QEvent *event) override;
 
 signals:
+    void requestUpdate();
     void nativeSizeChanged();
 
 protected:
@@ -189,27 +198,30 @@ private slots:
     void cameraStateChanged(QCamera::State newState);
 
 private:
-    static void frame_ready(GstElement *sink, int frame, void *data);
     static GstPadProbeReturn probe(GstPad *pad, GstPadProbeInfo *info, void *data);
 
+    inline static void show_frame(GstVideoSink *, GstBuffer *buffer, void *data);
+    inline static void buffers_invalidated(GstVideoSink *sink, void *data);
 
     QMutex m_mutex;
     QPointer<QGStreamerElementControl> m_control;
     GstElement* m_sink;
+    GstBuffer *m_queuedBuffer;
+    GstBuffer *m_currentBuffer;
     EGLDisplay m_display;
-    std::unique_ptr<GStreamerVideoTexture, void(*)(QObject*)> m_texture;
     QCamera *m_camera;
     QSize m_nativeSize;
     QSize m_textureSize;
     QSize m_implicitSize;
-    gulong m_signalId;
     gulong m_probeId;
+    gulong m_showFrameId;
+    gulong m_buffersInvalidatedId;
     int m_orientation;
     int m_textureOrientation;
     bool m_mirror;
-    bool m_active;
     bool m_geometryChanged;
-    bool m_frameChanged;
+    bool m_filtersChanged;
+    bool m_buffersInvalidated;
 
     // to keep track of added video filters locally, to avoid doing
     //   q->filters() and dealing with QQmlListProperty
