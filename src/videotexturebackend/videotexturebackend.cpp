@@ -31,31 +31,37 @@
  */
 
 #include "videotexturebackend.h"
+#include <gst/interfaces/nemoeglimagememory.h>
+
+#include <QLoggingCategory>
+#include <QElapsedTimer>
+
 
 namespace NemoVideoBackend {
 
-#define EGL_SYNC_FENCE_KHR                      0x30F9
+namespace {
+Q_LOGGING_CATEGORY(Timing, "org.sailfishos.multimedia.egltexture.times", QtWarningMsg)
+}
 
-GStreamerVideoTexture::GStreamerVideoTexture(GstElement *sink, EGLDisplay display)
-    : m_sink(sink)
+GStreamerVideoTexture::GStreamerVideoTexture(EGLDisplay display)
+    : m_buffer(nullptr)
     , m_display(display)
     , m_subRect(0, 0, 1, 1)
     , m_textureId(0)
-    , m_updated(false)
-    , m_videoBuffer(nullptr)
+    , m_buffersInvalidated(false)
 {
-    gst_object_ref(GST_OBJECT(m_sink));
 }
 
 GStreamerVideoTexture::~GStreamerVideoTexture()
 {
-    releaseTexture();
-
-    if (m_textureId) {
-        glDeleteTextures(1, &m_textureId);
+    for (const FilterInfo &info : m_filters) {
+        delete info.runnable;
     }
-    if (m_sink) {
-        gst_object_unref(GST_OBJECT(m_sink));
+
+    destroyCachedTextures();
+
+    if (m_buffer) {
+        gst_buffer_unref(m_buffer);
     }
 }
 
@@ -91,9 +97,7 @@ QRectF GStreamerVideoTexture::normalizedTextureSubRect() const
 
 void GStreamerVideoTexture::bind()
 {
-    if (m_textureId) {
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
-    }
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
 }
 
 bool GStreamerVideoTexture::updateTexture()
@@ -101,22 +105,26 @@ bool GStreamerVideoTexture::updateTexture()
     static const PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES
             = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
 
-    if (m_updated) {
-        return true;
+    if (m_buffersInvalidated) {
+        m_buffersInvalidated = false;
+        destroyCachedTextures();
+    } else if (!m_bufferChanged) {
+        return false;
     }
 
-    NemoGstVideoTexture *sink = NEMO_GST_VIDEO_TEXTURE(m_sink);
+    m_bufferChanged = false;
 
-    if (!nemo_gst_video_texture_acquire_frame(sink)) {
-        return false;
+    m_textureId = 0;
+
+    if (!m_buffer || gst_buffer_n_memory(m_buffer) == 0) {
+        return true;
     }
 
     int left = 0;
     int top = 0;
     int right = 0;
     int bottom = 0;
-    if (GstMeta *meta = nemo_gst_video_texture_get_frame_meta (sink,
-                GST_VIDEO_CROP_META_API_TYPE)) {
+    if (GstMeta *meta = gst_buffer_get_meta (m_buffer, GST_VIDEO_CROP_META_API_TYPE)) {
         GstVideoCropMeta *crop = (GstVideoCropMeta *) meta;
         left = crop->x;
         top = crop->y;
@@ -145,132 +153,128 @@ bool GStreamerVideoTexture::updateTexture()
 
     m_subRect = QRectF(x, y, width, height);
 
-    EGLImageKHR image;
-    if (!nemo_gst_video_texture_bind_frame(sink, &image)) {
-        if (m_textureId) {
-            glDeleteTextures(1, &m_textureId);
-            m_textureId = 0;
+    GstMemory *memory = gst_buffer_peek_memory(m_buffer, 0);
+
+    for (CachedTexture &texture : m_textures) {
+        if (texture.memory == memory) {
+            m_textureId = texture.textureId;
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
+            QElapsedTimer timer;
+            timer.start();
+            glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, texture.image);
+            qCDebug(Timing) << m_textureId << "bound in" << timer.elapsed();
+            break;
         }
-        nemo_gst_video_texture_release_frame(sink, NULL);
-        return false;
     }
 
-    if (!m_textureId) {
-        glGenTextures(1, &m_textureId);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
-        glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    } else {
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
+    if (m_textureId == 0) {
+        if (EGLImageKHR image = nemo_gst_egl_image_memory_create_image(memory, m_display, nullptr)) {
+            glGenTextures(1, &m_textureId);
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_textureId);
+            glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            QElapsedTimer timer;
+            timer.start();
+            glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
+            qCDebug(Timing) << m_textureId << "initial bind in" << timer.elapsed();
+            CachedTexture texture = { gst_memory_ref(memory), image, m_textureId};
+            m_textures.push_back(texture);
+        } else {
+            return true;
+        }
     }
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
 
     // if we have video filters attached to owning VideoOutput,
     // render video frame into a framebuffer to be able to get its pixels;
     // if no filters, don't do this, it affects performance.
 
-    // hold mutex lock on m_filters vector during processing
-    {
-        QMutexLocker locker(&m_filtersMutex);
-
-        if (!m_filters.isEmpty()) { // for example, QVector::isEmpty() requires mutex to be held
-
-            if (!m_videoBuffer) {
-                // create only once
-                m_videoBuffer = new TextureVideoBuffer();
-            }
-            // update texture size and ID for every frame
-            m_videoBuffer->setTextureSize(m_textureSize);
-            m_videoBuffer->setTextureId(m_textureId);
-            m_videoBuffer->updateFrame();  // renders frame image to FBO
+    if (!m_filters.isEmpty()) {
+        if (!m_videoBuffer) {
+            // create only once
+            m_videoBuffer.reset(new TextureVideoBuffer());
         }
-        //callVideoFilterRunnables has it's own locker
-    }
-    callVideoFilterRunnables();
+        // update texture size and ID for every frame
+        m_videoBuffer->setTextureSize(m_textureSize);
+        m_videoBuffer->setTextureId(m_textureId);
+        m_videoBuffer->updateFrame();  // renders frame image to FBO
 
-    m_updated = true;
+        callVideoFilterRunnables();
+    }
+
     return true;
 }
 
-void GStreamerVideoTexture::invalidateTexture()
+void GStreamerVideoTexture::destroyCachedTextures()
 {
-    if (m_textureId) {
-        glDeleteTextures(1, &m_textureId);
-        m_textureId = 0;
+    static const PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR
+            = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+
+    for (CachedTexture &texture : m_textures) {
+        glDeleteTextures(1, &texture.textureId);
+
+        eglDestroyImageKHR(m_display, texture.image);
+
+        gst_memory_unref(texture.memory);
+    }
+    m_textures.clear();
+}
+
+
+void GStreamerVideoTexture::setBuffer(GstBuffer *buffer)
+{
+    if (m_buffer != buffer) {
+        m_bufferChanged = true;
+
+        if (m_buffer) {
+            gst_buffer_unref(m_buffer);
+        }
+        m_buffer = gst_buffer_ref(buffer);
     }
 }
 
-void GStreamerVideoTexture::releaseTexture()
+void GStreamerVideoTexture::invalidateBuffers()
 {
-    static const PFNEGLCREATESYNCKHRPROC eglCreateSyncKHR
-            = reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(eglGetProcAddress("eglCreateSyncKHR"));
-
-    if (m_updated) {
-        m_updated = false;
-
-        if (m_videoBuffer) {
-            m_videoBuffer->setTextureId(0);   // invalidate texture id
-        }
-
-        NemoGstVideoTexture *sink = NEMO_GST_VIDEO_TEXTURE(m_sink);
-
-        nemo_gst_video_texture_unbind_frame(sink);
-
-        if (m_textureId) {
-            glDeleteTextures(1, &m_textureId);
-            m_textureId = 0;
-        }
-
-        EGLSyncKHR sync = eglCreateSyncKHR(m_display, EGL_SYNC_FENCE_KHR, NULL);
-        nemo_gst_video_texture_release_frame(sink, sync);
-    }
+    m_buffersInvalidated = true;
 }
 
-void GStreamerVideoTexture::invalidated()
+void GStreamerVideoTexture::syncFilters(QVector<FilterInfo> &filters)
 {
-    NemoGstVideoTexture *sink = NEMO_GST_VIDEO_TEXTURE(m_sink);
+    QVector<FilterInfo> existingFilters = m_filters;
+    m_filters.clear();
 
-    nemo_gst_video_texture_unbind_frame(sink);
+    for (auto it = filters.begin(); it != filters.end();) {
+        if (it->create) {
+            it->create = true;
+            it->destroy = false;
+            it->created = true;
 
-    if (m_textureId) {
-        glDeleteTextures(1, &m_textureId);
-        m_textureId = 0;
+            m_filters.append(FilterInfo(it->filter, it->filter->createFilterRunnable()));
+            ++it;
+        } else if (!it->destroy) {
+            auto existing = std::find_if(existingFilters.begin(), existingFilters.end(), [it](const FilterInfo &info) {
+               return it->filter == info.filter;
+            });
+            if (existing != existingFilters.end()) {
+                m_filters.append(*existing);
+                existingFilters.erase(existing);
+            }
+            ++it;
+        } else {
+            it = filters.erase(it);
+        }
     }
 
-    nemo_gst_video_texture_release_frame(sink, NULL);
-}
-
-QVector<FilterInfo> GStreamerVideoTexture::swapVideoFilters(QVector<FilterInfo> &filters)
-{
-    QMutexLocker guard(&m_filtersMutex);
-    m_filters.swap(filters);
-    createVideoFilterRunnables();
-    return filters;
-}
-
-void GStreamerVideoTexture::createVideoFilterRunnables()
-{
-    // intended to be called when m_filtersMutex is locked
-    for (FilterInfo &finfo: m_filters) {
-        if (Q_UNLIKELY(!finfo.filter)) {
-            continue;
-        }
-        if (!finfo.runnable) {
-            finfo.runnable = finfo.filter->createFilterRunnable();
-        }
+    for (const FilterInfo &info : existingFilters) {
+        delete info.runnable;
     }
 }
 
 void GStreamerVideoTexture::callVideoFilterRunnables()
 {
-    QMutexLocker locker(&m_filtersMutex);
-
     if(m_filters.isEmpty())
         return;
-
-    // intended to be called when m_filtersMutex is unlocked
 
     // create video frame and its format descriptor: construct
     //   video frame from video buffer
@@ -280,12 +284,9 @@ void GStreamerVideoTexture::callVideoFilterRunnables()
 
     bool frameWasFiltered = false;
     // pass frame to each filter
-    QVector<FilterInfo> filters = m_filters;
 
-    //we have local copy of filters and can process it without locking
-    locker.unlock();
-    for (int i = 0; i < filters.size(); ++i) {
-        const FilterInfo &finfo = filters.at(i);
+    for (int i = 0; i < m_filters.size(); ++i) {
+        const FilterInfo &finfo = m_filters.at(i);
         if (Q_UNLIKELY(!finfo.runnable)) {
             continue;
         }
@@ -293,7 +294,7 @@ void GStreamerVideoTexture::callVideoFilterRunnables()
         QVideoFilterRunnable::RunFlags runFlag = 0;
         // the only flag we can set for QVideoFilterRunnable is a marker
         //    that this filter is a last filter in chain
-        if (i == filters.size() - 1) {
+        if (i == m_filters.size() - 1) {
             runFlag |= QVideoFilterRunnable::LastInChain;
         }
 
@@ -393,7 +394,7 @@ const char *GStreamerVideoMaterialShader::fragmentShader() const
 {
     return  "\n #extension GL_OES_EGL_image_external : require"
             "\n uniform samplerExternalOES texture;"
-            "\n uniform lowp float opacity;\n"
+            "\n uniform lowp float opacity;"
             "\n varying highp vec2 frag_tx;"
             "\n void main(void)"
             "\n {"
@@ -432,6 +433,7 @@ GStreamerVideoNode::GStreamerVideoNode(GStreamerVideoTexture *texture)
 
 GStreamerVideoNode::~GStreamerVideoNode()
 {
+    delete m_material.m_texture;
 }
 
 void GStreamerVideoNode::preprocess()
@@ -470,18 +472,22 @@ void GStreamerVideoNode::setBoundingRect(
 NemoVideoTextureBackend::NemoVideoTextureBackend(QDeclarativeVideoOutput *parent)
     : QDeclarativeVideoBackend(parent)
     , m_sink(nullptr)
+    , m_queuedBuffer(nullptr)
+    , m_currentBuffer(nullptr)
     , m_display(0)
-    , m_texture(nullptr, [](QObject* obj) {if (obj) obj->deleteLater();})
     , m_camera(nullptr)
-    , m_signalId(0)
     , m_probeId(0)
+    , m_showFrameId(0)
+    , m_buffersInvalidatedId(0)
     , m_orientation(0)
     , m_textureOrientation(0)
     , m_mirror(false)
-    , m_active(false)
     , m_geometryChanged(false)
-    , m_frameChanged(false)
+    , m_filtersChanged(false)
+    , m_buffersInvalidated(false)
 {
+    connect(this, &NemoVideoTextureBackend::requestUpdate, q, &QQuickItem::update, Qt::QueuedConnection);
+
     if (QPlatformNativeInterface *nativeInterface = QGuiApplication::platformNativeInterface()) {
         m_display = nativeInterface->nativeResourceForIntegration("egldisplay");
     }
@@ -491,13 +497,13 @@ NemoVideoTextureBackend::NemoVideoTextureBackend(QDeclarativeVideoOutput *parent
 
     if ((m_sink = gst_element_factory_make("droideglsink", NULL))) {
         // Take ownership of the element or it will be destroyed when any bin it was added to is.
-        gst_object_ref(GST_OBJECT(m_sink));
         gst_object_ref_sink(GST_OBJECT(m_sink));
 
         g_object_set(G_OBJECT(m_sink), "egl-display", m_display, NULL);
 
-        m_signalId = g_signal_connect(
-                    G_OBJECT(m_sink), "frame-ready", G_CALLBACK(frame_ready), this);
+        m_showFrameId = g_signal_connect(G_OBJECT(m_sink), "show-frame", G_CALLBACK(show_frame), this);
+        m_buffersInvalidatedId = g_signal_connect(
+                    G_OBJECT(m_sink), "buffers-invalidated", G_CALLBACK(buffers_invalidated), this);
 
         m_probeId = gst_pad_add_probe(
                     gst_element_get_static_pad(m_sink, "sink"),
@@ -513,10 +519,19 @@ NemoVideoTextureBackend::~NemoVideoTextureBackend()
     releaseControl();
 
     if (m_sink) {
-        g_signal_handler_disconnect(G_OBJECT(m_sink), m_signalId);
+        g_signal_handler_disconnect(G_OBJECT(m_sink), m_showFrameId);
+        g_signal_handler_disconnect(G_OBJECT(m_sink), m_buffersInvalidatedId);
+
         gst_pad_remove_probe(gst_element_get_static_pad(m_sink, "sink"), m_probeId);
         gst_object_unref(GST_OBJECT(m_sink));
         m_sink = 0;
+    }
+
+    if (m_queuedBuffer) {
+        gst_buffer_unref(m_queuedBuffer);
+    }
+    if (m_currentBuffer) {
+        gst_buffer_unref(m_currentBuffer);
     }
 }
 
@@ -644,29 +659,59 @@ QSGNode *NemoVideoTextureBackend::updatePaintNode(QSGNode *oldNode, QQuickItem::
 
     QMutexLocker locker(&m_mutex);
 
-    if (!m_active) {
-        if (m_texture) {
-            m_texture->invalidateTexture();
+    if (!m_queuedBuffer) {
+        GstBuffer *currentBuffer = m_currentBuffer;
+        m_currentBuffer = nullptr;
+
+        if (m_filtersChanged) {
+            m_filtersChanged = false;
+
+            for (auto it = m_filters.begin(); it != m_filters.end();) {
+                if (it->destroy) {
+                    it = m_filters.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
+
+        locker.unlock();
+
+        if (currentBuffer) {
+            gst_buffer_unref(currentBuffer);
+        }
+
         delete node;
         return nullptr;
     }
 
-    if (!m_texture) {
-        m_texture.reset(new GStreamerVideoTexture(m_sink, m_display));
-        syncFilters();
-        connect(q->window(), &QQuickWindow::afterRendering,
-                m_texture.get(), &GStreamerVideoTexture::releaseTexture,
-                Qt::DirectConnection);
-        connect(q->window(), &QQuickWindow::sceneGraphInvalidated,
-                m_texture.get(), &GStreamerVideoTexture::invalidated,
-                Qt::DirectConnection);
-    }
-    m_texture->setTextureSize(m_textureSize);
-
     if (!node) {
-        node = new GStreamerVideoNode(m_texture.get());
+        node = new GStreamerVideoNode(new GStreamerVideoTexture(m_display));
+
         m_geometryChanged = true;
+        m_filtersChanged = !m_filters.isEmpty();
+    }
+
+    GStreamerVideoTexture * const texture = node->texture();
+
+    texture->setTextureSize(m_textureSize);
+    node->markDirty(QSGNode::DirtyMaterial);
+
+    if (m_buffersInvalidated) {
+        m_buffersInvalidated = false;
+        texture->invalidateBuffers();
+    }
+
+    GstBuffer *bufferToRelease = nullptr;
+    if (m_currentBuffer != m_queuedBuffer) {
+        bufferToRelease = m_currentBuffer;
+
+        m_currentBuffer = gst_buffer_ref(m_queuedBuffer);
+    }
+
+    if (m_filtersChanged) {
+        m_filtersChanged = false;
+        texture->syncFilters(m_filters);
     }
 
     if (m_geometryChanged) {
@@ -688,9 +733,12 @@ QSGNode *NemoVideoTextureBackend::updatePaintNode(QSGNode *oldNode, QQuickItem::
         m_geometryChanged = false;
     }
 
-    if (m_frameChanged) {
-        node->markDirty(QSGNode::DirtyMaterial);
-        m_frameChanged = false;
+    locker.unlock();
+
+    texture->setBuffer(m_currentBuffer);
+
+    if (bufferToRelease) {
+        gst_buffer_unref(bufferToRelease);
     }
 
     return node;
@@ -703,56 +751,30 @@ QAbstractVideoSurface *NemoVideoTextureBackend::videoSurface() const
 
 void NemoVideoTextureBackend::appendFilter(QAbstractVideoFilter *filter)
 {
-    QMutexLocker locker(&m_mutex);
-    m_filters += FilterInfo(filter);
-    syncFilters();
+    m_filtersChanged = true;
+    for (auto it = m_filters.begin(); it != m_filters.end(); ++it) {
+        FilterInfo &info = *it;
+
+        if (info.filter == filter) {
+            // Pointers make lousy unique ids as they can be recycled after an object is destroyed.
+            // So is removed or moved we'll flag it and delay removing until it has been synced.
+            info.create = info.destroy;
+            std::rotate(it, it + 1, m_filters.end());
+            return;
+        }
+    }
+    m_filters.append(FilterInfo(filter));
 }
 
 void NemoVideoTextureBackend::clearFilters()
 {
-    QMutexLocker locker(&m_mutex);
-    m_filters.clear();
-    syncFilters();
-}
-
-class FilterDeleterRunnable: public QRunnable
-{
-public:
-    FilterDeleterRunnable(const QList<QVideoFilterRunnable *> &runnables):
-        m_runnables(runnables) { }
-
-    virtual void run() override {
-        qDeleteAll(m_runnables);
-        m_runnables.clear();
-    }
-
-private:
-    QList<QVideoFilterRunnable *> m_runnables;
-};
-
-void NemoVideoTextureBackend::syncFilters()
-{
-    // This function may be called very early, during contruction of
-    // QQuickItem representing VideoOutput (QDeclarativeVideoOutput),
-    // and texture is created later, on first call to updatePaintNode(),
-    // so we may not have a texture here yet to notify about having filters.
-    // P.S. syncFilters() is called again in updatePaintNode() once, after
-    //      the texture is created.
-    if (m_texture) {
-        const QVector<FilterInfo> oldFilters = m_texture->swapVideoFilters(m_filters);
-        QList<QVideoFilterRunnable*> runnables;
-        for (const FilterInfo &oldFilter : oldFilters) {
-            if (oldFilter.runnable) {
-                runnables.append(oldFilter.runnable);
-            }
-        }
-        if (!runnables.isEmpty()) {
-            // Request the scenegraph to run our cleanup job on the render thread.
-            // The execution of our QRunnable may happen after the QML tree
-            // including the QAbstractVideoFilter instance is destroyed on the
-            // main thread so no references to it must be used during cleanup.
-            q->window()->scheduleRenderJob(new FilterDeleterRunnable(runnables),
-                                           QQuickWindow::BeforeSynchronizingStage);
+    m_filtersChanged = true;
+    for (auto it = m_filters.begin(); it != m_filters.end();) {
+        if (it->created) {
+            it->destroy = true;
+            ++it;
+        } else {
+            it = m_filters.erase(it);
         }
     }
 }
@@ -786,31 +808,42 @@ bool NemoVideoTextureBackend::event(QEvent *event)
         q->update();
         emit nativeSizeChanged();
         return true;
-    } else if (event->type() == QEvent::UpdateRequest) {
-        q->update();
-        return true;
     } else {
         return QObject::event(event);
     }
 }
 
-void NemoVideoTextureBackend::frame_ready(GstElement *, int frame, void *data)
+void NemoVideoTextureBackend::show_frame(GstVideoSink *, GstBuffer *buffer, void *data)
 {
     NemoVideoTextureBackend *instance = static_cast<NemoVideoTextureBackend *>(data);
 
-    if (frame < 0) {
-        QMutexLocker locker(&instance->m_mutex);
+    QMutexLocker locker(&instance->m_mutex);
 
-        instance->m_active = false;
-    } else {
-        QMutexLocker locker(&instance->m_mutex);
+    GstBuffer * const bufferToRelease = instance->m_queuedBuffer;
+    instance->m_queuedBuffer = buffer ? gst_buffer_ref(buffer) : nullptr;
 
-        instance->m_active = true;
-        instance->m_frameChanged = true;
+    locker.unlock();
+
+    if (bufferToRelease) {
+        gst_buffer_unref(bufferToRelease);
     }
 
-    QCoreApplication::postEvent(instance, new QEvent(QEvent::UpdateRequest));
+    instance->requestUpdate();
 }
+
+void NemoVideoTextureBackend::buffers_invalidated(GstVideoSink *, void *data)
+{
+    NemoVideoTextureBackend *instance = static_cast<NemoVideoTextureBackend *>(data);
+
+    {
+        QMutexLocker locker(&instance->m_mutex);
+
+        instance->m_buffersInvalidated = true;
+    }
+
+    instance->requestUpdate();
+}
+
 
 GstPadProbeReturn NemoVideoTextureBackend::probe(GstPad *, GstPadProbeInfo *info, void *data)
 {
