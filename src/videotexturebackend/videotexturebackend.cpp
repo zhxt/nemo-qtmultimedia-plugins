@@ -239,6 +239,14 @@ void GStreamerVideoTexture::invalidateBuffers()
     m_buffersInvalidated = true;
 }
 
+void GStreamerVideoTexture::resetTextures()
+{
+    m_textureId = 0;
+    destroyCachedTextures();
+
+    m_bufferChanged = true;
+}
+
 void GStreamerVideoTexture::syncFilters(QVector<FilterInfo> &filters)
 {
     QVector<FilterInfo> existingFilters = m_filters;
@@ -690,6 +698,12 @@ QSGNode *NemoVideoTextureBackend::updatePaintNode(QSGNode *oldNode, QQuickItem::
 
         m_geometryChanged = true;
         m_filtersChanged = !m_filters.isEmpty();
+
+        static const bool noRetainTextures = qEnvironmentVariableIntValue("QTMULTIMEDIA_VIDEO_TEXTURE_BACKEND_NO_RETAIN_TEXTURES") != 0;
+
+        if (noRetainTextures) {
+            QObject::connect(q->window(), &QQuickWindow::afterRendering, node->texture(), &GStreamerVideoTexture::resetTextures, Qt::DirectConnection);
+        }
     }
 
     GStreamerVideoTexture * const texture = node->texture();

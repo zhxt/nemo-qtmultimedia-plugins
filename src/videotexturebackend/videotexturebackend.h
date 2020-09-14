@@ -97,6 +97,8 @@ public:
     void invalidateBuffers();
     void syncFilters(QVector<FilterInfo> &filters);
 
+    void resetTextures();
+
 private:
     inline  void callVideoFilterRunnables();
     inline void destroyCachedTextures();
