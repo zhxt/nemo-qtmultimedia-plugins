@@ -53,6 +53,8 @@
 #include <qpa/qplatformnativeinterface.h>
 #include <private/qgstreamerelementcontrol_p.h>
 
+#include <QtCore/qplugin.h>
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <gst/video/gstvideometa.h>
